@@ -283,8 +283,7 @@ export async function connectAndWatch() {
       host: ftpConfig.host,
       port: ftpConfig.port || 21,
       user: ftpConfig.username || ftpConfig.user,
-      password: ftpConfig.password,
-      secure: ftpConfig.secure === true
+      password: ftpConfig.password
     });
 
     connected = true;
