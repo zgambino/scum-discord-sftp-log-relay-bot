@@ -1,12 +1,13 @@
 import { config } from './../config.js';
 import { handleRegistrationTokenMessage, sendToDiscord } from './discord.js';
-import SftpClient from 'ssh2-sftp-client';
+import { Client as FtpClient } from 'basic-ftp';
+import { Writable } from 'stream';
 import readline from 'readline';
 import iconv from 'iconv-lite';
 import { parseChatLogLine, parseLoginLogoutLogLine, parseKillLogLine } from './text.js';
 import { recordPlayerLogin, recordPlayerLogout } from './cache.js';
 
-let sftp = new SftpClient();
+let ftp = new FtpClient();
 const filePrefixes = ['login_', 'admin_', 'chat_', 'kill_'];
 const remoteDir = config.scum.game_logs_path;
 const pollInterval = 2000;
@@ -28,6 +29,19 @@ let connecting = false;
 
 const processedLineCache = new Map(); // file => { queue: [], set: Set }
 const prefixLocks = new Set();
+
+async function downloadRange(file, start, end) {
+  const chunks = [];
+  const destination = new Writable({
+    write(chunk, encoding, callback) {
+      chunks.push(Buffer.from(chunk));
+      callback();
+    }
+  });
+  await ftp.downloadTo(destination, file, start);
+  const data = Buffer.concat(chunks);
+  return data.subarray(0, Math.max(0, end - start + 1));
+}
 
 function stopAllTimers() {
   if (tailTimer) clearInterval(tailTimer);
@@ -149,12 +163,12 @@ function extractTimestampFromFilename(name) {
 
 async function findLatestFile(prefix) {
   if (!connected) return null;
-  const fileList = await sftp.list(remoteDir);
+  const fileList = await ftp.list(remoteDir);
   const matchingFiles = fileList
-    .filter(f => f.type === '-' && f.name.startsWith(prefix))
+    .filter(f => f.isFile && f.name.startsWith(prefix))
     .map(f => ({
       name: f.name,
-      path: `${remoteDir}/${f.name}`,
+      path: `${remoteDir.replace(/[\\/]+$/, '')}/${f.name}`,
       timestamp: extractTimestampFromFilename(f.name),
       size: f.size,
     }))
@@ -170,12 +184,11 @@ async function tailFile(prefix) {
 
   const { file, bytesRead } = tailState[prefix];
   try {
-    const stats = await sftp.stat(file);
-    const totalSize = stats.size;
+    const totalSize = await ftp.size(file);
     if (totalSize > bytesRead) {
-      const stream = await sftp.createReadStream(file, { start: bytesRead, end: totalSize - 1 });
-      const decodedStream = stream.pipe(iconv.decodeStream('utf16-le'));
-      const rl = readline.createInterface({ input: decodedStream, crlfDelay: Infinity });
+      const data = await downloadRange(file, bytesRead, totalSize - 1);
+      const text = iconv.decode(data, 'utf16-le');
+      const rl = readline.createInterface({ input: new (require('stream').Readable)({ read() { this.push(text); this.push(null); } }), crlfDelay: Infinity });
       for await (const line of rl) {
         const trimmed = line.trim();
         if (trimmed !== '') {
@@ -186,15 +199,10 @@ async function tailFile(prefix) {
     }
   } catch (err) {
     const msg = err.message || '';
-    if (msg.includes('Unexpected end event')) {
-      console.log(`[DEBUG ${prefix}] Suppressed tail error: ${msg}`);
-    } else if (msg.includes('No such file') || msg.includes('not found') || msg.includes('ENOENT') || msg.includes('does not exist')) {
-      // File was deleted (likely rotated). Reset tail state so checkForNewFiles
-      // can pick up the new file on its next cycle, or try to find it now.
+    if (msg.includes('No such file') || msg.includes('not found') || msg.includes('ENOENT') || msg.includes('does not exist')) {
       console.warn(`[TAIL ${prefix}] File gone (rotated/deleted): ${file}. Resetting tail state.`);
       clearProcessedLinesForFile(file);
       delete tailState[prefix];
-      // Try to find the new file immediately instead of waiting for checkForNewFiles
       try {
         const latest = await findLatestFile(prefix);
         if (latest) {
@@ -208,8 +216,6 @@ async function tailFile(prefix) {
       }
     } else {
       console.error(`[TAIL ERROR for ${prefix}]: ${msg}`);
-      // Don't reconnect here — the watchdog or next failed operation will handle it.
-      // This prevents rapid reconnect storms from a single bad file.
     }
   } finally {
     prefixLocks.delete(prefix);
@@ -222,8 +228,6 @@ async function checkForNewFiles() {
     try {
       const latest = await findLatestFile(prefix);
       if (!latest) {
-        // No files found for this prefix at all. If we had a stale tailState
-        // (e.g., from a deleted file), clear it so we don't keep erroring.
         if (tailState[prefix]) {
           console.warn(`[CHECK ${prefix}] No ${prefix} files found — clearing stale tail state.`);
           clearProcessedLinesForFile(tailState[prefix].file);
@@ -232,11 +236,8 @@ async function checkForNewFiles() {
         continue;
       }
       const state = tailState[prefix];
-      // Switch if no state yet, or if the latest file is different (by path)
       if (!state || latest.path !== state.file) {
-        if (state && state.file) {
-          clearProcessedLinesForFile(state.file);
-        }
+        if (state && state.file) clearProcessedLinesForFile(state.file);
         tailState[prefix] = { file: latest.path, timestamp: latest.timestamp, bytesRead: latest.size };
         console.log(`[SWITCHED] Now tailing ${prefix}${latest.name}`);
       }
@@ -250,9 +251,7 @@ async function resetTailState() {
   if (!connected) return;
   console.log('[RESET] Reinitializing tail state to latest log files');
   for (const prefix of filePrefixes) {
-    if (tailState[prefix] && tailState[prefix].file) {
-      clearProcessedLinesForFile(tailState[prefix].file);
-    }
+    if (tailState[prefix] && tailState[prefix].file) clearProcessedLinesForFile(tailState[prefix].file);
     const latest = await findLatestFile(prefix);
     if (latest) {
       tailState[prefix] = { file: latest.path, timestamp: latest.timestamp, bytesRead: latest.size };
@@ -265,32 +264,34 @@ async function startTailLoop() {
   if (tailTimer) clearInterval(tailTimer);
   tailTimer = setInterval(() => {
     for (const prefix of filePrefixes) {
-      tailFile(prefix).catch(err => {
-        console.error(`[TAIL UNCAUGHT ${prefix}]: ${err.message}`);
-      });
+      tailFile(prefix).catch(err => console.error(`[TAIL UNCAUGHT ${prefix}]: ${err.message}`));
     }
   }, pollInterval);
 }
 
-export function getSftpConnected() {
-  return connected;
-}
+export function getSftpConnected() { return connected; }
+export function getFtpConnected() { return connected; }
 
 export async function connectAndWatch() {
   if (connected || connecting) return;
   connecting = true;
   try {
-    // Add a connection timeout so we don't hang forever
-    const connectPromise = sftp.connect(config.sftp);
-    const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('SFTP connection timed out after 15s')), 15000)
-    );
-    await Promise.race([connectPromise, timeoutPromise]);
+    const ftpConfig = config.ftp || config.sftp;
+    if (!ftpConfig) throw new Error('Missing FTP configuration');
+
+    await ftp.access({
+      host: ftpConfig.host,
+      port: ftpConfig.port || 21,
+      user: ftpConfig.username || ftpConfig.user,
+      password: ftpConfig.password,
+      secure: ftpConfig.secure === true
+    });
+
     connected = true;
     reconnecting = false;
     retryDelay = 1000;
     connectionCount++;
-    console.log(`[CONNECTED] Active SFTP connections: ${connectionCount}`);
+    console.log(`[CONNECTED] Active FTP connections: ${connectionCount}`);
     console.log(`[CONNECTED] Watching prefixes: ${filePrefixes.join(', ')}`);
 
     await resetTailState();
@@ -298,7 +299,6 @@ export async function connectAndWatch() {
     if (switchTimer) clearInterval(switchTimer);
     switchTimer = setInterval(checkForNewFiles, checkNewFileInterval);
 
-    // Start watchdog to ensure no hangs — also checks if SFTP is silent for too long
     if (watchdogTimer) clearInterval(watchdogTimer);
     watchdogTimer = setInterval(() => {
       if (!connected && Date.now() - lastReconnectTime > watchdogInterval) {
@@ -323,24 +323,16 @@ async function reconnectWithBackoff() {
   connecting = false;
   stopAllTimers();
 
-  // Cancel any pending reconnect timer
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
 
-  // Always create a fresh SFTP client to avoid half-closed state issues
-  try {
-    if (typeof sftp.removeAllListeners === 'function') {
-      sftp.removeAllListeners();
-    }
-    await sftp.end().catch(() => {});
-  } catch { /* ignore error */ }
+  ftp.close();
+  ftp = new FtpClient();
+  ftp.ftp.socket.setTimeout?.(15000);
   connectionCount = Math.max(connectionCount - 1, 0);
-  console.log(`[DISCONNECTED] Active SFTP connections: ${connectionCount}`);
-
-  sftp = new SftpClient();
-  attachSftpListeners();
+  console.log(`[DISCONNECTED] Active FTP connections: ${connectionCount}`);
 
   const baseDelay = Math.max(retryDelay, minReconnectDelay);
   const delay = baseDelay + Math.floor(Math.random() * 500);
@@ -349,38 +341,16 @@ async function reconnectWithBackoff() {
   lastReconnectTime = Date.now();
   reconnectTimer = setTimeout(async () => {
     reconnectTimer = null;
-    reconnecting = false; // always clear
+    reconnecting = false;
     await connectAndWatch();
   }, delay);
 
   retryDelay = Math.min(retryDelay * 2, 60000);
 }
 
-function attachSftpListeners() {
-  // Increase max listeners on the underlying SSH2 client to suppress warnings on reconnect
-  if (sftp.client && typeof sftp.client.setMaxListeners === 'function') {
-    sftp.client.setMaxListeners(20);
-  }
-  sftp.on('end', () => { console.warn('[SFTP] end event raised'); reconnectWithBackoff(); });
-  sftp.on('close', () => { console.warn('[SFTP] close event raised'); reconnectWithBackoff(); });
-  sftp.on('error', err => {
-    const msg = err.message || '';
-    if (msg.includes('ECONNRESET') || msg.includes('handshake') || msg.includes('Keepalive')) {
-      console.warn(`[SFTP WARN] ${msg}`);
-    } else {
-      console.error(`[SFTP ERROR] ${msg}`);
-    }
-    reconnectWithBackoff();
-  });
-}
-
-// Attach listeners initially
-attachSftpListeners();
-
 process.on('SIGINT', async () => {
   console.log('Shutting down...');
   stopAllTimers();
-  try { await sftp.end(); }
-  catch { /* ignore error */ }
+  ftp.close();
   process.exit(0);
 });
